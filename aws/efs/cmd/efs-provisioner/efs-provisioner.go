@@ -120,7 +120,7 @@ func (p *efsProvisioner) Provision(options controller.VolumeOptions) (*v1.Persis
 		return nil, fmt.Errorf("claim.Spec.Selector is not supported")
 	}
 
-	err := p.createVolume(p.getLocalPath(options), p.getPermissions(options))
+	err := p.createVolume(p.getLocalPath(options), p.getPermissions(options), p.getGidBit(options))
 	if err != nil {
 		return nil, err
 	}
@@ -149,22 +149,26 @@ func (p *efsProvisioner) Provision(options controller.VolumeOptions) (*v1.Persis
 	return pv, nil
 }
 
-func (p *efsProvisioner) createVolume(path string, perm string) error {
+func (p *efsProvisioner) createVolume(path string, perm string, gidbit bool) error {
 	// Perm is passed as a string, we need to convert it to a FileMode
 	iperm, ipermErr := strconv.ParseUint(perm, 0, 32)
 	if ipermErr != nil {
 		return fmt.Errorf("permission mask could not be converted to int: %v", ipermErr)
 	}
 
+	// mode := os.FileMode(iperm)
 	mode := os.FileMode(iperm)
-	gmode := os.FileMode(mode | os.ModeSetgid)
 
-	if err := os.MkdirAll(path, gmode); err != nil {
+	if gidbit {
+		mode = os.FileMode(mode | os.ModeSetgid)
+	}
+
+	if err := os.MkdirAll(path, mode); err != nil {
 		return err
 	}
 
 	// Due to umask, need to chmod
-	if err := os.Chmod(path, gmode); err != nil {
+	if err := os.Chmod(path, mode); err != nil {
 		os.RemoveAll(path)
 		return err
 	}
@@ -190,6 +194,13 @@ func (p *efsProvisioner) getDirectoryName(options controller.VolumeOptions) stri
 
 func (p *efsProvisioner) getPermissions(options controller.VolumeOptions) string {
 	return options.PVC.Annotations["efs.ironstar.io/permission-mask"]
+}
+
+func (p *efsProvisioner) getGidBit(options controller.VolumeOptions) bool {
+	if options.PVC.Annotations["efs.ironstar.io/set-gid-bit"] == "true" {
+		return true
+	}
+	return false
 }
 
 // Delete removes the storage asset that was created by Provision represented
