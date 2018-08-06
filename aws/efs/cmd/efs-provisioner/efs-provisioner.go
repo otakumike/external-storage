@@ -199,6 +199,9 @@ func (p *efsProvisioner) createVolume(path string, gid *int) error {
 		return err
 	}
 
+	// Change owner to the 'tok' user
+	os.Chown(path, 1001, 0)
+
 	if gid != nil {
 		cmd := exec.Command("chgrp", strconv.Itoa(*gid), path)
 		out, err := cmd.CombinedOutput()
