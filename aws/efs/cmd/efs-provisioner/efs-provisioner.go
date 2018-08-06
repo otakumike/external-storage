@@ -20,7 +20,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"path"
 	"strconv"
 	"strings"
@@ -31,7 +30,6 @@ import (
 	"github.com/docker/docker/pkg/mount"
 	"github.com/golang/glog"
 	"github.com/kubernetes-incubator/external-storage/lib/controller"
-	"github.com/kubernetes-incubator/external-storage/lib/gidallocator"
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -49,7 +47,6 @@ type efsProvisioner struct {
 	dnsName    string
 	mountpoint string
 	source     string
-	allocator  gidallocator.Allocator
 }
 
 // NewEFSProvisioner creates an AWS EFS volume provisioner
@@ -90,7 +87,6 @@ func NewEFSProvisioner(client kubernetes.Interface) controller.Provisioner {
 		dnsName:    dnsName,
 		mountpoint: mountpoint,
 		source:     source,
-		allocator:  gidallocator.New(client),
 	}
 }
 
@@ -124,32 +120,7 @@ func (p *efsProvisioner) Provision(options controller.VolumeOptions) (*v1.Persis
 		return nil, fmt.Errorf("claim.Spec.Selector is not supported")
 	}
 
-	gidAllocate := true
-	for k, v := range options.Parameters {
-		switch strings.ToLower(k) {
-		case "gidmin":
-		// Let allocator handle
-		case "gidmax":
-		// Let allocator handle
-		case "gidallocate":
-			b, err := strconv.ParseBool(v)
-			if err != nil {
-				return nil, fmt.Errorf("invalid value %s for parameter %s: %v", v, k, err)
-			}
-			gidAllocate = b
-		}
-	}
-
-	var gid *int
-	if gidAllocate {
-		allocate, err := p.allocator.AllocateNext(options)
-		if err != nil {
-			return nil, err
-		}
-		gid = &allocate
-	}
-
-	err := p.createVolume(p.getLocalPath(options), gid)
+	err := p.createVolume(p.getLocalPath(options), p.getPermissions(options))
 	if err != nil {
 		return nil, err
 	}
@@ -174,42 +145,32 @@ func (p *efsProvisioner) Provision(options controller.VolumeOptions) (*v1.Persis
 			MountOptions: []string{"vers=4.1"},
 		},
 	}
-	if gidAllocate {
-		pv.ObjectMeta.Annotations = map[string]string{
-			gidallocator.VolumeGidAnnotationKey: strconv.FormatInt(int64(*gid), 10),
-		}
-	}
 
 	return pv, nil
 }
 
-func (p *efsProvisioner) createVolume(path string, gid *int) error {
-	perm := os.FileMode(0777)
-	if gid != nil {
-		perm = os.FileMode(0771 | os.ModeSetgid)
+func (p *efsProvisioner) createVolume(path string, perm string) error {
+	// Perm is passed as a string, we need to convert it to a FileMode
+	iperm, ipermErr := strconv.ParseUint(perm, 0, 32)
+	if ipermErr != nil {
+		return fmt.Errorf("permission mask could not be converted to int: %v", ipermErr)
 	}
 
-	if err := os.MkdirAll(path, perm); err != nil {
+	mode := os.FileMode(iperm)
+	gmode := os.FileMode(mode | os.ModeSetgid)
+
+	if err := os.MkdirAll(path, gmode); err != nil {
 		return err
 	}
 
 	// Due to umask, need to chmod
-	if err := os.Chmod(path, perm); err != nil {
+	if err := os.Chmod(path, gmode); err != nil {
 		os.RemoveAll(path)
 		return err
 	}
 
-	// Change owner to the 'tok' user
-	os.Chown(path, 1001, 0)
-
-	if gid != nil {
-		cmd := exec.Command("chgrp", strconv.Itoa(*gid), path)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			os.RemoveAll(path)
-			return fmt.Errorf("chgrp failed with error: %v, output: %s", err, out)
-		}
-	}
+	// Owner is `tok` and group is `web` in Tokaido environments
+	os.Chown(path, 1001, 1001)
 
 	return nil
 }
@@ -227,14 +188,18 @@ func (p *efsProvisioner) getDirectoryName(options controller.VolumeOptions) stri
 	return options.PVC.Name + "-" + options.PVName
 }
 
+func (p *efsProvisioner) getPermissions(options controller.VolumeOptions) string {
+	return options.PVC.Annotations["efs.ironstar.io/permission-mask"]
+}
+
 // Delete removes the storage asset that was created by Provision represented
 // by the given PV.
 func (p *efsProvisioner) Delete(volume *v1.PersistentVolume) error {
 	//TODO ignorederror
-	err := p.allocator.Release(volume)
-	if err != nil {
-		return err
-	}
+	// err := p.allocator.Release(volume)
+	// if err != nil {
+	// 	return err
+	// }
 
 	path, err := p.getLocalPathToDelete(volume.Spec.NFS)
 	if err != nil {
